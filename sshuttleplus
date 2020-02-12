@@ -1,0 +1,354 @@
+#!/usr/bin/env python3
+
+__description__    = 'Maniplulates a sshuttle connection mostly to automatically prevent it from blocking remote access to your machine once connected'
+__author__    = 'Cedric Rochat <rochatc@gmail.com>'
+__date__    = '10.02.2020'
+
+# required module: paramiko
+
+# USE THE SCRIPT WITH SUDO!
+
+import sys
+import re
+import signal
+import time
+import subprocess
+import ipaddress
+import paramiko
+import pprint
+import pexpect
+import getpass
+
+host = None
+user = None
+passwd = None
+
+# Uncomment and use it if you are brave
+#host = 'remote_server_hostname'
+#user = 'myUser'
+#passwd = 'myPasswordd'
+
+
+sshuttle_params = ['--dns', '0/0']
+wait_forever = True
+
+pp = pprint.PrettyPrinter(indent=4)
+
+class SshuttlePlus:
+    __general_console_charset = None
+    __host = None
+    __user = None
+    __passwd = None
+    __sshuttle_params = None
+    __client = None
+    __remote_dns_servers = None
+    __local_ifaces = None
+
+    def __init__(self, host, user, passwd, sshuttle_params=None):
+        self.__general_console_charset = 'utf8'
+        self.__host = host
+        self.__user = user
+        self.__passwd = passwd
+        if isinstance(sshuttle_params, list):
+            self.__sshuttle_params = sshuttle_params
+        self.__remote_dns_servers = None
+        self.__local_ifaces = None
+
+    def connect(self):
+        client = None
+        try:
+            client = paramiko.SSHClient()
+            client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            client.connect(self.__host, username=self.__user, password=self.__passwd)
+            self.__client = client
+        except:
+            print("Can't establish SSH connection!")
+            sys.exit(1)
+
+    def disconnect(self):
+        if self.__client is not None:
+            self.__client.close()
+            self.__client = None
+
+    def _analyse_remote_dns(self):
+        if self.__client is None:
+            self.connect()
+        if self.__client is not None:
+            stdin, stdout, stderr = self.__client.exec_command("grep '^search' /etc/resolv.conf|awk '{print $NF}'")
+            dns_domain = stdout.readline().strip()
+            if dns_domain != '':
+                stdin, stdout, stderr = self.__client.exec_command("host -t ns %s|awk '{print $NF}'" %(dns_domain+'.'))
+                dns_servers = stdout.readlines()
+                for item in dns_servers:
+                    stdin, stdout, stderr = self.__client.exec_command("host -t a %s|awk '{print $NF}'" %(item.strip()))
+                    ns_ip = stdout.readline().strip()
+                    if ns_ip != '':
+                        if self.__remote_dns_servers is None:
+                            self.__remote_dns_servers = []
+                        if ns_ip not in self.__remote_dns_servers:
+                            self.__remote_dns_servers.append(ns_ip)
+
+    def _analyse_local_ifaces(self):
+        ifaces = []
+
+        iface = None
+        iface_skip = False
+        proc = subprocess.Popen(['ip link show'], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=1, shell=True)
+        for line in iter(proc.stdout.readline, b''):
+            line = line.decode(self.__general_console_charset)
+            fields = line.split()
+            if re.search(r'^\d*:', fields[0]):
+                if ':' in fields[1].rstrip(':'):
+                    iface_skip = True
+                else:
+                    iface_skip = False
+                if not iface_skip:
+                    iface = {'id': None, 'type': None, 'bridge_type': None, 'bridge_master_id': None, 'bridge_master_name': None,
+                            'name': None, 'mac': None, 'state': None, 'low_state': None, 'mtu': None, 'addresses': []}
+                    iface['id'] = fields[0].rstrip(':')
+                    iface['name'] = fields[1].rstrip(':')
+                    address = {'name': iface['name'], 'ipv4': None, 'ipv4_proto': None, 'ipv4_netmask': None, 'ipv4_network': None,
+                            'ipv4_network_cidr': None, 'ipv4_broadcast': None, 'ipv4_cidr': None, 'ipv4_prefix_len': None, 'ipv4_gateway': None,
+                            'ipv4_dns': [], 'ipv6': None}
+                    iface['addresses'].append(address)
+                    states = fields[2].lower().strip('<>').split(',')
+                    if 'up' in states:
+                        iface['state'] = 'up'
+                    elif 'down' in states:
+                        iface['state'] = 'down'
+                    if states[0] == 'no-carrier':
+                        iface['low_state'] = 'down'
+                    else:
+                        if 'lower_up' in states:
+                            iface['low_state'] = 'up'
+                        elif 'lower_down' in states:
+                            iface['low_state'] = 'down'
+                        elif 'state' in fields:
+                            i = 0
+                            for field in fields:
+                                if field == 'state':
+                                    iface['low_state'] = fields[i + 1].lower()
+                                    break
+                                i += 1
+                    if fields[3] == 'mtu':
+                        iface['mtu'] = fields[4]
+            elif not iface_skip and re.search(r'link', fields[0]):
+                iface['type'] = fields[0].split('/')[1]
+                if len(fields) >= 2:
+                    iface['mac'] = fields[1]
+                ifaces.append(iface)
+
+        bridge_ifaces = []
+        bridge_iface = None
+        proc = subprocess.Popen(['bridge link'], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=1, shell=True)
+        for line in iter(proc.stdout.readline, b''):
+            line = line.decode(self.__general_console_charset)
+            fields = line.split()
+            if re.search(r' master ', line) and re.search(r'^\d*:', fields[0]):
+                bridge_iface = {'id': None, 'bridge_type': None, 'bridge_master_id': None, 'bridge_master_name': None, 'name': None}
+                bridge_iface['id'] = fields[0].rstrip(':')
+                bridge_iface['name'] = fields[1]
+                if fields[8] == 'master':
+                    bridge_iface['bridge_type'] = 'slave'
+                    bridge_iface['bridge_master_name'] = fields[9]
+                    if_check_count = 0
+                    for ifcheck in ifaces:
+                        if ifcheck['name'] == bridge_iface['bridge_master_name']:
+                            bridge_iface['bridge_master_id'] = ifcheck['id']
+                            if ifcheck['bridge_type'] is None:
+                                ifaces[if_check_count]['type'] = 'bridge'
+                                ifaces[if_check_count]['bridge_type'] = 'master'
+                        if_check_count += 1
+                if_check_count = 0
+                for ifcheck in ifaces:
+                    if ifcheck['name'] == bridge_iface['name']:
+                        break
+                    if_check_count += 1
+                ifaces[if_check_count]['bridge_type'] = bridge_iface['bridge_type']
+                ifaces[if_check_count]['bridge_master_id'] = bridge_iface['bridge_master_id']
+                ifaces[if_check_count]['bridge_master_name'] = bridge_iface['bridge_master_name']
+
+        iface = None
+        iface_count = -1
+        iface_skip = False
+        proc = subprocess.Popen(['ip address list'], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=1, shell=True)
+        for line in iter(proc.stdout.readline, b''):
+            line = line.decode(self.__general_console_charset)
+            fields = line.split()
+            address = {'name': None, 'ipv4': None, 'ipv4_proto': None, 'ipv4_netmask': None, 'ipv4_network': None, 'ipv4_network_cidr': None,
+                    'ipv4_broadcast': None, 'ipv4_cidr': None, 'ipv4_prefix_len': None, 'ipv4_gateway': None, 'ipv4_dns': [], 'ipv6': None}
+            if re.search(r'^\d*:', fields[0]):
+                if ':' in fields[1].rstrip(':'):
+                    iface_skip = True
+                else:
+                    iface_skip = False
+                if not iface_skip:
+                    iface_count += 1
+                    ifaceid = int(fields[0].rstrip(':'))
+            elif not iface_skip and re.search(r'inet$', fields[0]):
+                if ifaces[iface_count]['addresses'] is None:
+                    ifaces[iface_count]['addresses'] = []
+                address['name'] = fields[len(fields) - 1]
+                ipv4 = fields[1]
+                ipv4iface = ipaddress.IPv4Interface(ipv4)
+                ipv4network = ipv4iface.network
+                ipv4ip = ipv4iface.ip
+                if re.search(r'/', ipv4): address['ipv4_cidr'] = ipv4
+                if re.search(r'/', ipv4): address['ipv4_prefix_len'] = str(ipv4network.with_prefixlen).split('/')[1]
+                address['ipv4'] = str(ipv4ip)
+                if re.search(r'/', ipv4): address['ipv4_netmask'] = str(ipv4network.with_netmask).split('/')[1]
+                if re.search(r'/', ipv4): address['ipv4_network'] = str(ipv4network.network_address)
+                if re.search(r'/', ipv4): address['ipv4_network_cidr'] = str(ipv4network.with_prefixlen)
+                if re.search(r'/', ipv4): address['ipv4_broadcast'] = str(ipv4network.broadcast_address)
+
+
+                if address['name'] == ifaces[iface_count]['name']:
+                    ifaces[iface_count]['addresses'][0] = address
+                else:
+                    ifaces[iface_count]['addresses'].append(address)
+            elif not iface_skip and re.search(r'inet6', fields[0]):
+                if ifaces[iface_count]['addresses'] is None:
+                    ifaces[iface_count]['addresses'] = []
+                if len(ifaces[iface_count]['addresses']) > 0 and ifaces[iface_count]['addresses'][0]['name'] == ifaces[iface_count]['name']:
+                    ifaces[iface_count]['addresses'][0]['ipv6'] = fields[1]
+                else:
+                    address['ipv6'] = fields[1]
+                    ifaces[iface_count]['addresses'].append(address)
+
+        proc = subprocess.Popen(['ip route list'], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=1, shell=True)
+        for line in iter(proc.stdout.readline, b''):
+            line = line.decode(self.__general_console_charset)
+            fields = line.split()
+            if re.search(r'^default', fields[0]):
+                if fields[1] == 'via':
+                    gateway_ip = fields[2]
+                    if fields[3] == 'dev':
+                        gateway_iface = fields[4]
+                        if_check_count = 0
+                        for ifcheck in ifaces:
+                            if ifcheck['name'] == gateway_iface:
+                                address_check_count = 0
+                                for address_check in ifcheck['addresses']:
+                                    if address_check['name'] == gateway_iface:
+                                        ifaces[if_check_count]['addresses'][address_check_count]['ipv4_gateway'] = gateway_ip
+                                    address_check_count += 1
+                            if_check_count += 1
+        self.__local_ifaces = ifaces
+        #cat /var/run/dhclient-enp0s25.pid
+        #ps ax|awk -v pid=5838 '{if ($1==pid) print $NF}'
+
+    def get_remote_dns(self):
+        if self.__remote_dns_servers is None:
+            self._analyse_remote_dns()
+
+        return self.__remote_dns_servers
+
+    def get_local_ifaces(self):
+        if self.__local_ifaces is None:
+            self._analyse_local_ifaces()
+
+        return self.__local_ifaces
+
+    def get_local_networks(self, aliens_only=False):
+        networks = []
+        ifaces = self.get_local_ifaces()
+        for iface in ifaces:
+            if aliens_only and iface['name'] == 'lo':
+                continue
+            if iface['state'] == 'up':
+                for address in iface['addresses']:
+                    network = address['ipv4_network_cidr']
+                    if network is not None and network != '' and network not in networks:
+                        networks.append(network)
+
+        return networks
+
+    def sshuttle(self):
+        remote_dns_servers = self.get_remote_dns()
+        remote_dns_servers_string = '\n'.join(remote_dns_servers)
+        local_networks = self.get_local_networks(aliens_only=True)
+        local_networks_string = '\n'.join(local_networks)
+
+        command = f'sshuttle -r {self.__user}@{self.__host} -x {self.__host}'
+        if len(local_networks) > 0:
+            command += ' -x '
+        command += ' -x '.join('{}'.format(network) for network in local_networks)
+        if '--dns' not in self.__sshuttle_params and len(remote_dns_servers) > 0:
+            """ You'll be able to play with
+            host -t a host.intranet.remote.domain. [intranet-accessible DNS IP]
+            echo "nameserver [intranet DNS1 IP]\nnameserver [intranet DNS2 IP]\nnameserver [intranet DNS3 IP]\nnameserver [intranet DNS4 IP]\nsearch intranet.remote.domain\n" | resolvconf -a eth0.inet
+            then do the same but with -d eth0.inet to remove.
+            systemd-resolve --status
+            we still lose local DNS queries with this solution so far..."""
+            command += ' --ns-hosts '
+            command += ','.join('{}'.format(remote_dns) for remote_dns in remote_dns_servers)
+        if self.__sshuttle_params is not None:
+            command += ' ' + ' '.join(self.__sshuttle_params)
+        print(command)
+
+        try:
+            print(f"""Trying to establish a sshuttle connection with {self.__user}@{self.__host}.
+I will also exclude your local network(s) from the tunneling redirections. These are:
+{local_networks_string}
+
+By the way, I also got the remote DNS servers list. Here it is:
+{remote_dns_servers_string}
+
+""")
+            child = pexpect.spawn(command, encoding='utf-8')
+            if '-vv' in self.__sshuttle_params:
+                child.logfile = sys.stdout
+            ret = child.expect(".*assword:")
+            if ret == 0:
+                child.sendline(self.__passwd)
+            ret = child.expect(".*onnected.")
+            if ret == 0:
+                print('Connection established successfully!')
+                while True:
+                    if child.isalive():
+                        pass
+                    else:
+                        if wait_forever:
+                            print("""Apparently, the peer has no activity since a while, but as
+I said, it may only 'appear' this way. As the script
+is configured to wait forever, I won't do anything...""")
+                        else:
+                            print("""It appears that the peer didn't respond since a while.
+Closing connection...""")
+                            break
+        except:
+            pass
+
+def signal_handler(sig, frame):
+    name = sig
+    if sig == 2:
+        name = 'SIGINT'
+    elif sig == 15:
+        name = 'SIGTERM'
+    print('Terminated by signal %s' %(name))
+    sys.exit(0)
+
+def main():
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+
+    global host
+    global user
+    global passwd
+
+    if len(sys.argv[1:]) >= 1 or (user is not None and host is not None):
+        if user is None and host is None:
+            args = sys.argv[1].split('@')
+            if len(args) == 2:
+                user, host = args
+        if passwd is None:
+            passwd = getpass.getpass(f'Password for connection {user}@{host}: ')
+    else:
+        print(f'Usage: {sys.argv[0]} [user]@[host]\n')
+        sys.exit(1)
+
+    sshuttleplus = SshuttlePlus(host, user, passwd, sshuttle_params)
+    sshuttleplus.sshuttle()
+
+if __name__ == '__main__':
+    main()
