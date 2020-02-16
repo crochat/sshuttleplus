@@ -1,12 +1,10 @@
 #!/usr/bin/env python3
 
 __description__    = 'Maniplulates a sshuttle connection mostly to automatically prevent it from blocking remote access to your machine once connected'
-__author__    = 'Cedric Rochat <rochatc@gmail.com>'
-__date__    = '10.02.2020'
+__author__         = 'Cedric Rochat <rochatc@gmail.com>'
+__date__           = '10.02.2020'
 
 # required module: paramiko
-
-# USE THE SCRIPT WITH SUDO!
 
 import sys
 import re
@@ -75,12 +73,16 @@ class SshuttlePlus:
             self.connect()
         if self.__client is not None:
             stdin, stdout, stderr = self.__client.exec_command("grep '^search' /etc/resolv.conf|awk '{print $NF}'")
-            dns_domain = stdout.readline().strip()
-            if dns_domain != '':
+            dns_domains = stdout.readlines()
+            for i, dns_domain in enumerate(dns_domains):
+                dns_domain = dns_domain.strip()
+                dns_domains[i] = dns_domain
+
                 stdin, stdout, stderr = self.__client.exec_command("host -t ns %s|awk '{print $NF}'" %(dns_domain+'.'))
                 dns_servers = stdout.readlines()
-                for item in dns_servers:
-                    stdin, stdout, stderr = self.__client.exec_command("host -t a %s|awk '{print $NF}'" %(item.strip()))
+                for dns_server in dns_servers:
+                    stdin, stdout, stderr = self.__client.exec_command("host -t a %s|awk '{print $NF}'" %(dns_server.strip()))
+
                     ns_ip = stdout.readline().strip()
                     if ns_ip != '':
                         if self.__remote_dns_servers is None:
@@ -107,6 +109,8 @@ class SshuttlePlus:
                             'name': None, 'mac': None, 'state': None, 'low_state': None, 'mtu': None, 'addresses': []}
                     iface['id'] = fields[0].rstrip(':')
                     iface['name'] = fields[1].rstrip(':')
+                    if re.search(r'@', iface['name']):
+                        iface['name'] = iface['name'].split('@')[0]
                     address = {'name': iface['name'], 'ipv4': None, 'ipv4_proto': None, 'ipv4_netmask': None, 'ipv4_network': None,
                             'ipv4_network_cidr': None, 'ipv4_broadcast': None, 'ipv4_cidr': None, 'ipv4_prefix_len': None, 'ipv4_gateway': None,
                             'ipv4_dns': [], 'ipv6': None}
@@ -298,9 +302,22 @@ By the way, I also got the remote DNS servers list. Here it is:
             child = pexpect.spawn(command, encoding='utf-8')
             if '-vv' in self.__sshuttle_params:
                 child.logfile = sys.stdout
-            ret = child.expect(".*assword:")
-            if ret == 0:
-                child.sendline(self.__passwd)
+            while True:
+                ret = child.expect([".*sudo.*assword:", ".*continue connecting.*yes/no", ".*assword:"])
+                if ret == 0:
+                    sudo_passwd = getpass.getpass('[local sudo] Password: ')
+                    child.sendline(sudo_passwd)
+                elif ret == 1:
+                    #print(1)
+                    #prompt = child.readline()
+                    #prompt = 'yes/no'
+                    #confirm = input(prompt)
+                    #print('@'+confirm+'@')
+                    confirm = 'yes'
+                    child.sendline(confirm)
+                elif ret == 2:
+                    child.sendline(self.__passwd)
+                    break
             ret = child.expect(".*onnected.")
             if ret == 0:
                 print('Connection established successfully!')
