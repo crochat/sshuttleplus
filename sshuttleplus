@@ -4,8 +4,9 @@ __description__    = 'Maniplulates a sshuttle connection mostly to automatically
 __author__         = 'Cedric Rochat <rochatc@gmail.com>'
 __date__           = '10.02.2020'
 
+# required module: paramiko
+
 import sys
-import os
 import re
 import signal
 import time
@@ -36,14 +37,10 @@ class SshuttlePlus:
     __host = None
     __user = None
     __passwd = None
-    __sudo_passwd = None
     __sshuttle_params = None
     __client = None
     __remote_dns_servers = None
     __local_ifaces = None
-    __ipt_dns_ok = False
-    __ipt_sshuttle_ports = 12300
-    __ipt_sshuttle_chain = f'sshuttle-{__ipt_sshuttle_ports}'
 
     def __init__(self, host, user, passwd, sshuttle_params=None):
         self.__general_console_charset = 'utf8'
@@ -52,39 +49,24 @@ class SshuttlePlus:
         self.__passwd = passwd
         if isinstance(sshuttle_params, list):
             self.__sshuttle_params = sshuttle_params
-        self.__remote_dns = {'domains': None, 'servers': None}
+        self.__remote_dns_servers = None
         self.__local_ifaces = None
 
     def connect(self):
         client = None
-        while client is None:
-            try:
-                client = paramiko.SSHClient()
-                client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-                client.connect(self.__host, username=self.__user, password=self.__passwd)
-                self.__client = client
-            except paramiko.ssh_exception.AuthenticationException as e:
-                client = None
-                if self.__passwd is None:
-                    self.__passwd = getpass.getpass(f'Password for connection {self.__user}@{self.__host}: ')
-                else:
-                    print("Can't establish SSH connection!")
-                    sys.exit(1)
-            except Exception as e:
-                print("Can't establish SSH connection!")
-                print(e)
-                sys.exit(1)
+        try:
+            client = paramiko.SSHClient()
+            client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            client.connect(self.__host, username=self.__user, password=self.__passwd)
+            self.__client = client
+        except:
+            print("Can't establish SSH connection!")
+            sys.exit(1)
 
     def disconnect(self):
         if self.__client is not None:
             self.__client.close()
             self.__client = None
-
-    def _sudo_cmd(self, cmd):
-        if self.__sudo_passwd is not None:
-            return 'echo %s | sudo ' % self.__sudo_passwd + cmd
-        else:
-            return 'sudo ' + cmd
 
     def _analyse_remote_dns(self):
         if self.__client is None:
@@ -93,25 +75,20 @@ class SshuttlePlus:
             stdin, stdout, stderr = self.__client.exec_command("grep '^search' /etc/resolv.conf|awk '{print $NF}'")
             dns_domains = stdout.readlines()
             for i, dns_domain in enumerate(dns_domains):
-                if self.__remote_dns['domains'] is None:
-                    self.__remote_dns['domains'] = []
                 dns_domain = dns_domain.strip()
-                self.__remote_dns['domains'].append(dns_domain)
+                dns_domains[i] = dns_domain
 
-                stdin2, stdout2, stderr2 = self.__client.exec_command("host -t ns %s|awk '{print $NF}'" %(dns_domain+'.'))
-                dns_servers = stdout2.readlines()
+                stdin, stdout, stderr = self.__client.exec_command("host -t ns %s|awk '{print $NF}'" %(dns_domain+'.'))
+                dns_servers = stdout.readlines()
                 for dns_server in dns_servers:
-                    dns_server = dns_server.strip()
-                    stdin3, stdout3, stderr3 = self.__client.exec_command("host -t a %s|awk '{print $NF}'" %(dns_server))
-                    dns_server_ip = stdout3.readline().strip()
-                    if dns_server_ip != '':
-                        if self.__remote_dns['servers'] is None:
-                            self.__remote_dns['servers'] = []
-                        dns_servers_ip_list = []
-                        if len(self.__remote_dns['servers']) > 0:
-                            dns_servers_ip_list = [ sub['ip'] for sub in self.__remote_dns['servers'] ]
-                        if dns_server_ip not in dns_servers_ip_list:
-                            self.__remote_dns['servers'].append({'domain': dns_domain, 'name': dns_server, 'ip': dns_server_ip})
+                    stdin, stdout, stderr = self.__client.exec_command("host -t a %s|awk '{print $NF}'" %(dns_server.strip()))
+
+                    ns_ip = stdout.readline().strip()
+                    if ns_ip != '':
+                        if self.__remote_dns_servers is None:
+                            self.__remote_dns_servers = []
+                        if ns_ip not in self.__remote_dns_servers:
+                            self.__remote_dns_servers.append(ns_ip)
 
     def _analyse_local_ifaces(self):
         ifaces = []
@@ -264,49 +241,11 @@ class SshuttlePlus:
         #cat /var/run/dhclient-enp0s25.pid
         #ps ax|awk -v pid=5838 '{if ($1==pid) print $NF}'
 
-    def _ipt_dns(self):
-        if not self.__ipt_dns_ok and '--dns' in self.__sshuttle_params:
-            rule_nr = None
-            ipt_dns_domains_rules = None
-            if self.__remote_dns['domains'] is not None:
-                time.sleep(0.1)
-                proc = subprocess.Popen([self._sudo_cmd(f'iptables -t nat -nv --list {self.__ipt_sshuttle_chain} --line-numbers')], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=1, shell=True)
-                for line in iter(proc.stdout.readline, b''):
-                    line = line.decode(self.__general_console_charset).strip()
-                    fields = line.split()
-                    if re.search(r'^\d', fields[0]):
-                        if fields[4] == 'udp' and fields[9] == '127.0.0.53':
-                            rule_nr = int(fields[0])
-                if rule_nr is not None:
-                    for domain in self.__remote_dns['domains']:
-                        ipt_dns_domain_string = ''
-                        if ipt_dns_domains_rules is None:
-                            ipt_dns_domains_rules = []
-                        if re.search(r'\.', domain):
-                            domain_parts = domain.split('.')
-                            ipt_dns_domain_string = '--hex-string "'
-                            for part in domain_parts:
-                                ipt_dns_domain_string += '|%s|%s' %(str('{0:x}'.format(len(part))).zfill(2), part)
-                            ipt_dns_domain_string += '"'
-                        else:
-                            ipt_dns_domain_string = f'--string {domain}'
-                        cmd = f'iptables -t nat -I {self.__ipt_sshuttle_chain} {rule_nr} -d 127.0.0.53 -p udp -m udp --dport 53 -m ttl ! --ttl-eq 42 -m string {ipt_dns_domain_string} --algo kmp -j REDIRECT --to-ports {self.__ipt_sshuttle_ports}'
-                        ipt_dns_domains_rules.append(cmd)
-
-            if ipt_dns_domains_rules is not None:
-                #print(ipt_dns_domains_rules)
-                for ipt_rule in ipt_dns_domains_rules:
-                    os.system(self._sudo_cmd(ipt_rule))
-                cmd = f'iptables -t nat -D {self.__ipt_sshuttle_chain} {rule_nr + len(ipt_dns_domains_rules)}'
-                #print(cmd)
-                os.system(self._sudo_cmd(cmd))
-            self.__ipt_dns_ok = True
-
     def get_remote_dns(self):
-        if self.__remote_dns['servers'] is None:
+        if self.__remote_dns_servers is None:
             self._analyse_remote_dns()
 
-        return self.__remote_dns
+        return self.__remote_dns_servers
 
     def get_local_ifaces(self):
         if self.__local_ifaces is None:
@@ -329,15 +268,8 @@ class SshuttlePlus:
         return networks
 
     def sshuttle(self):
-        remote_dns = self.get_remote_dns()
-        remote_dns_domains = remote_dns['domains']
-        remote_dns_servers = remote_dns['servers']
-        remote_dns_servers_string = ''
-        if remote_dns_servers is not None:
-            for dns_server in remote_dns_servers:
-                if remote_dns_servers_string != '':
-                    remote_dns_servers_string += "\n"
-                remote_dns_servers_string += f"{dns_server['name']}\t\t\t{dns_server['ip']}\t\t\t{dns_server['domain']} NS"
+        remote_dns_servers = self.get_remote_dns()
+        remote_dns_servers_string = '\n'.join(remote_dns_servers)
         local_networks = self.get_local_networks(aliens_only=True)
         local_networks_string = '\n'.join(local_networks)
 
@@ -345,54 +277,36 @@ class SshuttlePlus:
         if len(local_networks) > 0:
             command += ' -x '
         command += ' -x '.join('{}'.format(network) for network in local_networks)
-
-        no_dns_message = None
+        if '--dns' not in self.__sshuttle_params and len(remote_dns_servers) > 0:
+            """ You'll be able to play with
+            host -t a host.intranet.remote.domain. [intranet-accessible DNS IP]
+            echo "nameserver [intranet DNS1 IP]\nnameserver [intranet DNS2 IP]\nnameserver [intranet DNS3 IP]\nnameserver [intranet DNS4 IP]\nsearch intranet.remote.domain\n" | resolvconf -a eth0.inet
+            then do the same but with -d eth0.inet to remove.
+            systemd-resolve --status
+            we still lose local DNS queries with this solution so far..."""
+            command += ' --ns-hosts '
+            command += ','.join('{}'.format(remote_dns) for remote_dns in remote_dns_servers)
         if self.__sshuttle_params is not None:
-            if remote_dns_domains is None and '--dns' in self.__sshuttle_params:
-                self.__sshuttle_params.pop(self.__sshuttle_params.index('--dns'))
-                no_dns_message = """
-
-As I wasn't able to catch a specific enough remote DNS configuration, I removed '--dns'
-from the sshuttle parameters.
-This way, all your DNS queries will stay local.
-"""
             command += ' ' + ' '.join(self.__sshuttle_params)
         print(command)
 
-        message = f"""Trying to establish a sshuttle connection with {self.__user}@{self.__host}.
+        try:
+            print(f"""Trying to establish a sshuttle connection with {self.__user}@{self.__host}.
 I will also exclude your local network(s) from the tunneling redirections. These are:
 {local_networks_string}
-"""
-        if remote_dns_domains is not None:
-            message += f"""
 
-By the way, I also got the remote DNS configuration. Here it is:
-search domains: {', '.join(remote_dns_domains)}
-"""
-            message += f"""    Note that amongst DNS queries, I'll strive to only redirect those which target these domains.
-    This way, you'll still be able to use your local DNS for your usual (internal) queries...
-"""
-
-            message += f"""
-The remote DNS servers are:
+By the way, I also got the remote DNS servers list. Here it is:
 {remote_dns_servers_string}
-"""
-        elif no_dns_message is not None:
-            message += no_dns_message
-        print(message)
 
-        try:
-            connected = False
-
+""")
             child = pexpect.spawn(command, encoding='utf-8')
             if '-vv' in self.__sshuttle_params:
                 child.logfile = sys.stdout
-
-            while not connected:
-                ret = child.expect([".*sudo.*assword:", ".*continue connecting.*yes/no", ".*assword:", ".*onnected."])
+            while True:
+                ret = child.expect([".*sudo.*assword:", ".*continue connecting.*yes/no", ".*assword:"])
                 if ret == 0:
-                    self.__sudo_passwd = getpass.getpass('[local sudo] Password: ')
-                    child.sendline(self.__sudo_passwd)
+                    sudo_passwd = getpass.getpass('[local sudo] Password: ')
+                    child.sendline(sudo_passwd)
                 elif ret == 1:
                     #print(1)
                     #prompt = child.readline()
@@ -402,18 +316,14 @@ The remote DNS servers are:
                     confirm = 'yes'
                     child.sendline(confirm)
                 elif ret == 2:
-                    if self.__passwd is None:
-                        self.__passwd = getpass.getpass(f'Password for connection {user}@{host}: ')
                     child.sendline(self.__passwd)
-                elif ret == 3:
-                    print('Connection established successfully!')
-                    connected = True
-
-            if connected:
+                    break
+            ret = child.expect(".*onnected.")
+            if ret == 0:
+                print('Connection established successfully!')
                 while True:
                     if child.isalive():
-                        self._ipt_dns()
-                        time.sleep(0.01)
+                        pass
                     else:
                         if wait_forever:
                             print("""Apparently, the peer has no activity since a while, but as
@@ -423,9 +333,8 @@ is configured to wait forever, I won't do anything...""")
                             print("""It appears that the peer didn't respond since a while.
 Closing connection...""")
                             break
-        except Exception as e:
-            print('Unexpected error!')
-            print(e)
+        except:
+            pass
 
 def signal_handler(sig, frame):
     name = sig
@@ -449,6 +358,8 @@ def main():
             args = sys.argv[1].split('@')
             if len(args) == 2:
                 user, host = args
+        if passwd is None:
+            passwd = getpass.getpass(f'Password for connection {user}@{host}: ')
     else:
         print(f'Usage: {sys.argv[0]} [user]@[host]\n')
         sys.exit(1)
